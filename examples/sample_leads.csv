@@ -1,0 +1,8 @@
+Name,Email,Company,Phone
+Sample contact,alex@gmail.com,Sample Agency,0012345678
+Role account,info@gmail.com,Sample Agency,0098765432
+Duplicate contact, ALEX@GMAIL.COM ,Sample Agency,0012345678
+Disposable address,sample@mailinator.com,Sample Agency,0011111111
+Malformed address,not-an-email,Sample Agency,0022222222
+Missing domain,hello@openhousefx-demo-missing-20261028.com,Sample Agency,0033333333
+Another contact,jordan@outlook.com,Sample Agency,0044444444
