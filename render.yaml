@@ -1,5 +1,5 @@
-# Optional Render Blueprint. No persistent disk or database is provisioned.
-# For an existing service, use the README settings instead of creating a second service.
+# Optional Render Blueprint. Note: Render blocks outbound port 25 on every plan, so the
+# mailbox (SMTP) check is skipped there unless you set ZEROBOUNCE_API_KEY. All other checks work.
 services:
   - type: web
     name: openhousefx-verifier
@@ -8,3 +8,12 @@ services:
     buildCommand: python -m pip install -r requirements.txt
     startCommand: python -m streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
     healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ZEROBOUNCE_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false

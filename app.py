@@ -1,970 +1,112 @@
-"""Disk-backed, batch-oriented email syntax and domain verification engine."""
+"""OpenhouseFX Lead Verifier — Streamlit UI. The engine lives in the `verifier` package."""
 
 from __future__ import annotations
 
-import codecs
-import csv
-import json
-import math
-import os
-import sqlite3
-import threading
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Callable, Iterable
-
-import dns.exception
-import dns.resolver
-import pandas as pd
-from email_validator import EmailNotValidError, validate_email
-from openpyxl import Workbook, load_workbook
-from openpyxl.cell import WriteOnlyCell
-
-RESULT_COLUMNS = [
-    "Verification_Status",
-    "Reason",
-    "Is_Role",
-    "Is_Disposable",
-    "Is_Duplicate",
-    "Normalized_Email",
-    "Email_Domain",
-    "DNS_Check",
-]
-ROLE_ACCOUNTS = frozenset(
-    {
-        "admin",
-        "administrator",
-        "billing",
-        "bookings",
-        "care",
-        "careers",
-        "contact",
-        "enquiries",
-        "enquiry",
-        "hello",
-        "help",
-        "hr",
-        "info",
-        "jobs",
-        "legal",
-        "marketing",
-        "noreply",
-        "no-reply",
-        "office",
-        "operations",
-        "postmaster",
-        "privacy",
-        "reception",
-        "sales",
-        "security",
-        "service",
-        "support",
-        "team",
-        "webmaster",
-    }
-)
-_DNS_LOCAL = threading.local()
-
-
-@dataclass(frozen=True)
-class DomainResult:
-    """A domain result, never a claim that an individual mailbox receives mail."""
-
-    status: str
-    reason: str
-    dns_check: str
-
-
-def _build_resolver():
-    """Honor explicit/system DNS; use public DNS only if the OS has none."""
-    try:
-        resolver = dns.resolver.Resolver()
-    except dns.resolver.NoResolverConfiguration:
-        resolver = dns.resolver.Resolver(configure=False)
-    configured = os.getenv("VERIFIER_DNS_NAMESERVERS", "").strip()
-    if configured:
-        servers = [server.strip() for server in configured.split(",") if server.strip()]
-        if not servers:
-            raise ValueError(
-                "VERIFIER_DNS_NAMESERVERS must contain comma-separated DNS server IP addresses."
-            )
-        try:
-            # Assignment asks dnspython to validate each supplied server.
-            resolver.nameservers = servers
-        except (ValueError, TypeError) as error:
-            raise ValueError(
-                "Invalid VERIFIER_DNS_NAMESERVERS. Use comma-separated DNS server IP addresses."
-            ) from error
-    elif not resolver.nameservers:
-        # Some Windows/container environments expose no OS DNS servers. Use
-        # Cloudflare/Google only in that case; never replace working system DNS.
-        resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
-    resolver.timeout = 0.65
-    resolver.lifetime = 2.0
-    resolver.cache = dns.resolver.LRUCache(max_size=2048)
-    return resolver
-
-
-def validate_dns_configuration():
-    """Fail before starting a run when an explicit DNS override is malformed."""
-    return tuple(_build_resolver().nameservers)
-
-
-def _thread_resolver():
-    """Each worker owns its resolver; the dnspython LRU handles record TTLs."""
-    signature = os.getenv("VERIFIER_DNS_NAMESERVERS", "").strip()
-    if (
-        not hasattr(_DNS_LOCAL, "resolver")
-        or getattr(_DNS_LOCAL, "signature", None) != signature
-    ):
-        _DNS_LOCAL.resolver = _build_resolver()
-        _DNS_LOCAL.signature = signature
-    return _DNS_LOCAL.resolver
-
-
-def lookup_domain(
-    domain: str, timeout: float = 2.0, resolver=None, clock: Callable = time.monotonic
-) -> DomainResult:
-    """Check MX then implicit A/AAAA, sharing a <=2s DNS lifetime budget.
-
-    Timeout/SERVFAIL is inconclusive (Risky). Null MX explicitly declines mail.
-    A/AAAA fallback is Risky because no explicit mail service was found.
-    """
-    timeout = min(2.0, max(0.05, float(timeout)))
-    deadline = clock() + timeout
-    resolver = resolver if resolver is not None else _thread_resolver()
-    for record_type in ("MX", "A", "AAAA"):
-        remaining = deadline - clock()
-        if remaining <= 0:
-            return DomainResult(
-                "Risky", "DNS deadline exceeded; retry later", "Timeout"
-            )
-        try:
-            records = list(
-                resolver.resolve(domain, record_type, lifetime=remaining, search=False)
-            )
-            if not records:
-                continue
-            if record_type == "MX":
-                if any(str(record.exchange).strip() == "." for record in records):
-                    return DomainResult(
-                        "Invalid",
-                        "Domain explicitly declines email (null MX)",
-                        "Null MX",
-                    )
-                return DomainResult(
-                    "Valid", "MX records present; mailbox not tested", "MX"
-                )
-            return DomainResult(
-                "Risky",
-                f"No MX; {record_type} fallback exists, mail service unconfirmed",
-                record_type,
-            )
-        except dns.resolver.NXDOMAIN:
-            return DomainResult("Invalid", "Email domain does not exist", "NXDOMAIN")
-        except dns.resolver.NoAnswer:
-            continue
-        except (dns.exception.Timeout, dns.resolver.LifetimeTimeout):
-            return DomainResult("Risky", "DNS timed out; retry later", "Timeout")
-        except dns.resolver.NoNameservers:
-            return DomainResult(
-                "Risky", "DNS servers unavailable or SERVFAIL; retry later", "DNS error"
-            )
-        except dns.exception.DNSException:
-            return DomainResult(
-                "Risky", "DNS response inconclusive; retry later", "DNS error"
-            )
-        except OSError:
-            return DomainResult(
-                "Risky", "Network unavailable; retry later", "Network error"
-            )
-    return DomainResult("Invalid", "No MX, A or AAAA mail route found", "No route")
-
-
-def _safe_columns(headers: Iterable) -> tuple[list[str], list[dict]]:
-    """Keep names where possible; make blank/duplicate/reserved names explicit."""
-    used, result, renames = set(RESULT_COLUMNS), [], []
-    for index, raw in enumerate(headers):
-        original = "" if raw is None else str(raw)
-        base = original if original.strip() else f"Column_{index + 1}"
-        candidate = f"{base}_Original" if base in RESULT_COLUMNS else base
-        stem, suffix = candidate, 2
-        while candidate in used:
-            candidate = f"{stem}_{suffix}"
-            suffix += 1
-        used.add(candidate)
-        result.append(candidate)
-        if candidate != original:
-            renames.append(
-                {"position": index + 1, "original": original, "renamed": candidate}
-            )
-    if not result:
-        raise ValueError("The file has no column headers.")
-    return result, renames
-
-
-def detect_email_column(columns: Iterable[str]) -> int | None:
-    names = [
-        "".join(ch for ch in str(column).strip().casefold() if ch.isalnum())
-        for column in columns
-    ]
-    for aliases in ({"email", "emailaddress", "emailid"}, {"mail", "contactemail"}):
-        for index, name in enumerate(names):
-            if name in aliases:
-                return index
-    for index, name in enumerate(names):
-        if "email" in name:
-            return index
-    for index, name in enumerate(names):
-        if name in {"contact", "mailaddress"}:
-            return index
-    return None
-
-
-def _csv_format(path: Path) -> tuple[str, str]:
-    """Validate UTF-8 incrementally, then fall back to lossless Latin-1."""
-    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
-    encoding = "utf-8-sig"
-    try:
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                decoder.decode(block)
-            decoder.decode(b"", final=True)
-    except UnicodeDecodeError:
-        encoding = "latin-1"
-    with path.open("r", encoding=encoding, newline="") as handle:
-        sample = handle.read(65536)
-    try:
-        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
-    except csv.Error:
-        delimiter = ","
-    return encoding, delimiter
-
-
-def _is_blank(row: Iterable) -> bool:
-    return all(
-        value is None or (isinstance(value, str) and not value.strip()) for value in row
-    )
-
-
-@contextmanager
-def _xlsx_reader(path):
-    """Use a file handle so temporary filenames need not end in .xlsx."""
-    with Path(path).open("rb") as handle:
-        workbook = load_workbook(handle, read_only=True, data_only=False)
-        try:
-            yield workbook
-        finally:
-            workbook.close()
-
-
-def _raw_rows(path: Path, info: dict):
-    """Skip only all-empty rows; keep all other cells, padding short CSV rows."""
-    extension = info["extension"]
-    if extension == ".csv":
-        with path.open("r", encoding=info["encoding"], newline="") as handle:
-            reader = csv.reader(handle, delimiter=info["delimiter"])
-            next(reader, None)
-            for source_row, row in enumerate(reader, 2):
-                if _is_blank(row):
-                    continue
-                if len(row) > len(info["columns"]):
-                    raise ValueError(
-                        f"CSV row {source_row} has more cells than the header. Check the delimiter."
-                    )
-                yield row + [""] * (len(info["columns"]) - len(row))
-    elif extension == ".xlsx":
-        with _xlsx_reader(path) as workbook:
-            sheet = workbook[info["sheet_name"]]
-            sheet.reset_dimensions()
-            rows = sheet.iter_rows(values_only=True)
-            next(rows, None)
-            for row in rows:
-                row = list(row)
-                if _is_blank(row):
-                    continue
-                if len(row) > len(info["columns"]):
-                    if any(value is not None for value in row[len(info["columns"]) :]):
-                        raise ValueError(
-                            "An Excel data row extends beyond the header. Add names to all data columns."
-                        )
-                    row = row[: len(info["columns"])]
-                yield row + [None] * (len(info["columns"]) - len(row))
-    else:
-        import xlrd
-
-        workbook = xlrd.open_workbook(str(path), on_demand=True)
-        try:
-            sheet = workbook.sheet_by_name(info["sheet_name"])
-            for row_index in range(1, sheet.nrows):
-                row = []
-                for column in range(sheet.ncols):
-                    cell = sheet.cell(row_index, column)
-                    value = cell.value
-                    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
-                        value = None
-                    elif cell.ctype == xlrd.XL_CELL_DATE:
-                        value = xlrd.xldate.xldate_as_datetime(value, workbook.datemode)
-                    elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
-                        value = bool(value)
-                    row.append(value)
-                if not _is_blank(row):
-                    yield row
-        finally:
-            workbook.release_resources()
-
-
-def inspect_input(
-    path, filename: str | None = None, sheet_name: str | None = None
-) -> dict:
-    """Inspect headers/sheets and count rows without loading a giant frame."""
-    path = Path(path)
-    extension = Path(filename or path.name).suffix.lower()
-    if extension not in {".csv", ".xlsx", ".xls"}:
-        raise ValueError("Choose a CSV, XLSX or XLS file.")
-    info = {
-        "extension": extension,
-        "sheets": [],
-        "sheet_name": None,
-        "encoding": None,
-        "delimiter": None,
-    }
-    if extension == ".csv":
-        info["encoding"], info["delimiter"] = _csv_format(path)
-        with path.open("r", encoding=info["encoding"], newline="") as handle:
-            headers = next(csv.reader(handle, delimiter=info["delimiter"]), [])
-    elif extension == ".xlsx":
-        with _xlsx_reader(path) as workbook:
-            info["sheets"] = workbook.sheetnames
-            selected = sheet_name or workbook.sheetnames[0]
-            if selected not in workbook.sheetnames:
-                raise ValueError("The selected sheet no longer exists.")
-            info["sheet_name"] = selected
-            sheet = workbook[selected]
-            sheet.reset_dimensions()
-            headers = next(sheet.iter_rows(values_only=True), ())
-    else:
-        import xlrd
-
-        workbook = xlrd.open_workbook(str(path), on_demand=True)
-        try:
-            info["sheets"] = workbook.sheet_names()
-            info["sheet_name"] = sheet_name or info["sheets"][0]
-            sheet = workbook.sheet_by_name(info["sheet_name"])
-            headers = sheet.row_values(0) if sheet.nrows else []
-        finally:
-            workbook.release_resources()
-    info["columns"], info["column_renames"] = _safe_columns(headers)
-    info["email_index"] = detect_email_column(info["columns"])
-    info["row_count"] = sum(1 for _ in _raw_rows(path, info))
-    return info
-
-
-def _json_value(value):
-    if isinstance(value, datetime):
-        return {"__ohfx_type": "datetime", "value": value.isoformat()}
-    if isinstance(value, date):
-        return {"__ohfx_type": "date", "value": value.isoformat()}
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    return str(value)
-
-
-def _decode_value(value):
-    if isinstance(value, dict) and value.get("__ohfx_type") == "datetime":
-        return datetime.fromisoformat(value["value"])
-    if isinstance(value, dict) and value.get("__ohfx_type") == "date":
-        return date.fromisoformat(value["value"])
-    return value
-
-
-def _disposable_match(domain: str, domains: frozenset) -> bool:
-    parts = domain.casefold().split(".")
-    return any(".".join(parts[index:]) in domains for index in range(len(parts) - 1))
-
-
-def _syntax(value) -> tuple[str, str, str | None]:
-    """Validate a supported RFC email address; retain original cell separately."""
-    if not isinstance(value, str) or not value.strip():
-        return "", "", "Missing or non-text email address"
-    try:
-        parsed = validate_email(
-            value.strip(),
-            check_deliverability=False,
-            allow_smtputf8=False,
-            strict=True,
-            allow_quoted_local=True,
-            allow_domain_literal=False,
-        )
-        return parsed.normalized, parsed.ascii_domain.casefold(), None
-    except EmailNotValidError as error:
-        return "", "", f"Invalid syntax: {error}"
-
-
-@contextmanager
-def _open_db(path):
-    """Always release Windows file handles, including on failed runs."""
-    connection = sqlite3.connect(str(path))
-    try:
-        connection.execute("PRAGMA journal_mode=DELETE")
-        with connection:
-            yield connection
-    finally:
-        connection.close()
-
-
-def _metadata(connection) -> dict:
-    row = connection.execute(
-        "SELECT value FROM metadata WHERE key='summary'"
-    ).fetchone()
-    if row is None:
-        raise ValueError("This verification did not finish. Start a new run.")
-    return json.loads(row[0])
-
-
-def _emit_progress(
-    callback, start, stage, processed, total, checked, unique, counts=None
-):
-    if callback is None:
-        return
-    elapsed = time.monotonic() - start
-    eta = (elapsed / processed) * (total - processed) if processed else None
-    callback(
-        {
-            "stage": stage,
-            "rows_processed": processed,
-            "total_rows": total,
-            "domains_checked": checked,
-            "unique_domains": unique,
-            "elapsed": elapsed,
-            "eta": eta,
-            "counts": dict(counts or {}),
-        }
-    )
-
-
-def run_verification(
-    input_path,
-    output_dir,
-    email_index: int,
-    workers: int = 35,
-    batch_size: int = 2000,
-    sheet_name: str | None = None,
-    disposable_domains: frozenset = frozenset(),
-    progress: Callable | None = None,
-    domain_lookup: Callable | None = None,
-    filename: str | None = None,
-) -> dict:
-    """Verify bounded batches with disk-backed deduplication and domain caching.
-
-    At most 2*workers futures are outstanding. Per-run domain results and seen
-    email keys live in SQLite. Duplicate rows remain in full exports as Invalid.
-    """
-    if not 1 <= int(workers) <= 50:
-        raise ValueError("Workers must be between 1 and 50.")
-    if not 1 <= int(batch_size) <= 5000:
-        raise ValueError("Batch size must be between 1 and 5,000.")
-    start = time.monotonic()
-    info = inspect_input(input_path, filename=filename, sheet_name=sheet_name)
-    if not 0 <= int(email_index) < len(info["columns"]):
-        raise ValueError("Choose a valid email column.")
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = output_dir / "results.sqlite3"
-    if db_path.exists():
-        raise ValueError(
-            "This result folder already contains a run. Choose a new folder."
-        )
-    batch_id = str(uuid.uuid4())
-    lookup = domain_lookup or lookup_domain
-    if domain_lookup is None:
-        validate_dns_configuration()
-    counts = dict.fromkeys(
-        (
-            "total",
-            "valid",
-            "invalid",
-            "risky",
-            "invalid_domains",
-            "role",
-            "disposable",
-            "duplicates",
-        ),
-        0,
-    )
-    summary = {
-        "batch_id": batch_id,
-        "db_path": str(db_path),
-        "filename": filename or Path(input_path).name,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "sheet_name": info["sheet_name"],
-        "original_columns": info["columns"],
-        "column_renames": info["column_renames"],
-        "email_column": info["columns"][email_index],
-        "row_count": info["row_count"],
-        "counts": counts,
-        "exports": {},
-        "workers": int(workers),
-        "batch_size": int(batch_size),
-    }
-    checked = 0
-    with _open_db(db_path) as connection:
-        connection.executescript("""
-            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE seen_emails (email TEXT PRIMARY KEY);
-            CREATE TABLE domains (domain TEXT PRIMARY KEY, status TEXT, reason TEXT, dns_check TEXT);
-            CREATE TABLE results (
-                row_index INTEGER PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL,
-                reason TEXT NOT NULL, is_role INTEGER NOT NULL, is_disposable INTEGER NOT NULL,
-                is_duplicate INTEGER NOT NULL, normalized_email TEXT, domain TEXT, dns_check TEXT,
-                search_text TEXT NOT NULL
-            );
-            CREATE INDEX results_status ON results(status);
-        """)
-        _emit_progress(progress, start, "Preparing", 0, info["row_count"], 0, 0, counts)
-        with ThreadPoolExecutor(
-            max_workers=int(workers), thread_name_prefix="ohfx-dns"
-        ) as pool:
-            source = iter(_raw_rows(Path(input_path), info))
-            while True:
-                batch = []
-                for _ in range(int(batch_size)):
-                    try:
-                        batch.append(next(source))
-                    except StopIteration:
-                        break
-                if not batch:
-                    break
-                prepared, uncached = [], set()
-                for row in batch:
-                    email, domain, syntax_error = _syntax(row[email_index])
-                    duplicate = False
-                    raw_email = row[email_index]
-                    duplicate_key = (
-                        email.casefold()
-                        if email
-                        else (
-                            raw_email.strip().casefold()
-                            if isinstance(raw_email, str) and raw_email.strip()
-                            else None
-                        )
-                    )
-                    if duplicate_key:
-                        cursor = connection.execute(
-                            "INSERT OR IGNORE INTO seen_emails(email) VALUES (?)",
-                            (duplicate_key,),
-                        )
-                        duplicate = cursor.rowcount == 0
-                    local = (
-                        email.rsplit("@", 1)[0].strip('"').casefold().split("+", 1)[0]
-                        if email
-                        else ""
-                    )
-                    is_role = local in ROLE_ACCOUNTS
-                    is_disposable = bool(
-                        domain and _disposable_match(domain, disposable_domains)
-                    )
-                    if domain and not syntax_error:
-                        if (
-                            connection.execute(
-                                "SELECT 1 FROM domains WHERE domain=?", (domain,)
-                            ).fetchone()
-                            is None
-                        ):
-                            uncached.add(domain)
-                    prepared.append(
-                        (
-                            row,
-                            email,
-                            domain,
-                            syntax_error,
-                            duplicate,
-                            is_role,
-                            is_disposable,
-                        )
-                    )
-                # Submission is bounded even if a batch contains many unique domains.
-                domain_iter, pending = iter(sorted(uncached)), {}
-                target_domains = checked + len(uncached)
-
-                def submit_more():
-                    while len(pending) < 2 * int(workers):
-                        try:
-                            domain = next(domain_iter)
-                        except StopIteration:
-                            break
-                        pending[pool.submit(lookup, domain)] = domain
-
-                submit_more()
-                while pending:
-                    future = next(as_completed(tuple(pending)))
-                    domain = pending.pop(future)
-                    try:
-                        result = future.result()
-                        if result.status not in {"Valid", "Invalid", "Risky"}:
-                            raise ValueError("Unknown domain status")
-                    except Exception:
-                        result = DomainResult(
-                            "Risky", "Domain lookup failed; retry later", "DNS error"
-                        )
-                    connection.execute(
-                        "INSERT INTO domains VALUES (?,?,?,?)",
-                        (domain, result.status, result.reason, result.dns_check),
-                    )
-                    checked += 1
-                    if checked % 10 == 0 or not pending:
-                        _emit_progress(
-                            progress,
-                            start,
-                            "Checking domains",
-                            counts["total"],
-                            info["row_count"],
-                            checked,
-                            target_domains,
-                            counts,
-                        )
-                    submit_more()
-                inserts = []
-                for (
-                    row,
-                    email,
-                    domain,
-                    syntax_error,
-                    duplicate,
-                    is_role,
-                    is_disposable,
-                ) in prepared:
-                    dns_status, dns_reason, dns_check = "", "", "Not checked"
-                    if domain:
-                        dns_status, dns_reason, dns_check = connection.execute(
-                            "SELECT status,reason,dns_check FROM domains WHERE domain=?",
-                            (domain,),
-                        ).fetchone()
-                    if syntax_error:
-                        status, reason = "Invalid", syntax_error
-                        if duplicate:
-                            reason += "; duplicate email entry"
-                    elif duplicate:
-                        status, reason = (
-                            "Invalid",
-                            "Duplicate email; see first occurrence",
-                        )
-                        if dns_status == "Invalid":
-                            reason += "; " + dns_reason
-                    elif dns_status == "Invalid":
-                        status, reason = "Invalid", dns_reason
-                    elif is_disposable or is_role or dns_status == "Risky":
-                        flags = []
-                        if is_role:
-                            flags.append("Role-based business account")
-                        if is_disposable:
-                            flags.append("Disposable email provider")
-                        if dns_status == "Risky":
-                            flags.append(dns_reason)
-                        status, reason = "Risky", "; ".join(flags)
-                    else:
-                        status, reason = "Valid", dns_reason
-                    counts["total"] += 1
-                    counts[status.lower()] += 1
-                    counts["invalid_domains"] += int(dns_status == "Invalid")
-                    counts["role"] += int(is_role)
-                    counts["disposable"] += int(is_disposable)
-                    counts["duplicates"] += int(duplicate)
-                    payload = json.dumps(
-                        [_json_value(value) for value in row], ensure_ascii=False
-                    )
-                    search_text = " ".join(
-                        [
-                            *(str(value) for value in row if value is not None),
-                            status,
-                            reason,
-                            email,
-                            domain,
-                            dns_check,
-                        ]
-                    ).casefold()
-                    inserts.append(
-                        (
-                            counts["total"],
-                            payload,
-                            status,
-                            reason,
-                            int(is_role),
-                            int(is_disposable),
-                            int(duplicate),
-                            email,
-                            domain,
-                            dns_check,
-                            search_text,
-                        )
-                    )
-                connection.executemany(
-                    "INSERT INTO results VALUES (?,?,?,?,?,?,?,?,?,?,?)", inserts
-                )
-                connection.commit()
-                _emit_progress(
-                    progress,
-                    start,
-                    "Verifying rows",
-                    counts["total"],
-                    info["row_count"],
-                    checked,
-                    checked,
-                    counts,
-                )
-        summary["unique_domains"] = checked
-        summary["duration_seconds"] = round(time.monotonic() - start, 3)
-        summary["exports"] = {
-            "full_csv": str(output_dir / "openhousefx_all_results.csv"),
-            "valid_csv": str(output_dir / "openhousefx_valid_leads.csv"),
-            "invalid_risky_csv": str(output_dir / "openhousefx_invalid_risky.csv"),
-            "role_disposable_csv": str(output_dir / "openhousefx_role_disposable.csv"),
-        }
-    _emit_progress(
-        progress,
-        start,
-        "Preparing exports",
-        counts["total"],
-        info["row_count"],
-        checked,
-        checked,
-        counts,
-    )
-    _generate_csv_exports(db_path, summary)
-    # Only completed reports are recoverable; interrupted/failed exports have no summary.
-    with _open_db(db_path) as connection:
-        connection.execute(
-            "INSERT INTO metadata VALUES ('summary',?)", (json.dumps(summary),)
-        )
-    _emit_progress(
-        progress,
-        start,
-        "Complete",
-        counts["total"],
-        info["row_count"],
-        checked,
-        checked,
-        counts,
-    )
-    return summary
-
-
-def _result_values(record):
-    values = [_decode_value(value) for value in json.loads(record[1])]
-    return values + [
-        record[2],
-        record[3],
-        bool(record[4]),
-        bool(record[5]),
-        bool(record[6]),
-        record[7],
-        record[8],
-        record[9],
-    ]
-
-
-def _generate_csv_exports(db_path, summary):
-    """Write all category CSVs in a single streaming pass."""
-    handles = {}
-    try:
-        writers = {}
-        for key, path in summary["exports"].items():
-            handles[key] = open(path, "w", encoding="utf-8-sig", newline="")
-            writers[key] = csv.writer(handles[key])
-            writers[key].writerow(summary["original_columns"] + RESULT_COLUMNS)
-        with _open_db(db_path) as connection:
-            for record in connection.execute(
-                "SELECT * FROM results ORDER BY row_index"
-            ):
-                values = _result_values(record)
-                writers["full_csv"].writerow(values)
-                writers[
-                    "valid_csv" if record[2] == "Valid" else "invalid_risky_csv"
-                ].writerow(values)
-                if record[4] or record[5]:
-                    writers["role_disposable_csv"].writerow(values)
-    finally:
-        for handle in handles.values():
-            handle.close()
-
-
-def read_results(
-    db_path, status: str = "All", search: str = "", limit: int = 100, offset: int = 0
-) -> tuple[pd.DataFrame, int]:
-    """Fetch a bounded page using parameterized status/search filters."""
-    limit, offset = max(1, min(1000, int(limit))), max(0, int(offset))
-    where, params = [], []
-    if status in {"Valid", "Invalid", "Risky"}:
-        where.append("status=?")
-        params.append(status)
-    elif status == "Invalid & Risky":
-        where.append("status IN ('Invalid','Risky')")
-    elif status == "Role / Disposable":
-        where.append("(is_role=1 OR is_disposable=1)")
-    if search.strip():
-        where.append("instr(search_text,?)>0")
-        params.append(search.strip().casefold())
-    clause = " WHERE " + " AND ".join(where) if where else ""
-    with _open_db(db_path) as connection:
-        summary = _metadata(connection)
-        count = connection.execute(
-            "SELECT COUNT(*) FROM results" + clause, params
-        ).fetchone()[0]
-        records = connection.execute(
-            "SELECT * FROM results" + clause + " ORDER BY row_index LIMIT ? OFFSET ?",
-            [*params, limit, offset],
-        ).fetchall()
-    frame = pd.DataFrame(
-        [_result_values(record) for record in records],
-        columns=summary["original_columns"] + RESULT_COLUMNS,
-    )
-    return frame, count
-
-
-def generate_xlsx(db_path, path) -> str:
-    """Stream an XLSX report; source formula-like text remains literal text.
-
-    Reject oversize cells rather than allowing Excel's 32,767-character cell
-    limit to silently truncate them. Full CSV remains available for such input.
-    """
-    path = Path(path)
-    with _open_db(db_path) as connection:
-        summary = _metadata(connection)
-        if summary["counts"]["total"] > 1_048_575:
-            raise ValueError(
-                "This report exceeds Excel's row limit. Use the full CSV export."
-            )
-        headers = summary["original_columns"] + RESULT_COLUMNS
-        if len(headers) > 16_384:
-            raise ValueError(
-                "This report exceeds Excel's column limit. Use the CSV export."
-            )
-        workbook = Workbook(write_only=True)
-        sheet = workbook.create_sheet("Verification results")
-        sheet.freeze_panes = "A2"
-
-        def append_literal(values):
-            cells = []
-            for value in values:
-                if isinstance(value, str):
-                    if len(value) > 32767:
-                        raise ValueError(
-                            "A cell exceeds Excel's 32,767-character limit. Use CSV to preserve it."
-                        )
-                    cell = WriteOnlyCell(sheet, value=value)
-                    cell.data_type = "s"
-                    cells.append(cell)
-                else:
-                    cells.append(value)
-            sheet.append(cells)
-
-        try:
-            append_literal(headers)
-            for record in connection.execute(
-                "SELECT * FROM results ORDER BY row_index"
-            ):
-                append_literal(_result_values(record))
-            workbook.save(path)
-        except Exception:
-            workbook.close()
-            if path.exists():
-                path.unlink()
-            raise
-    return str(path)
-
-
-def load_summary(db_path) -> dict:
-    """Read a completed disk-backed run after browser or process restart."""
-    with _open_db(db_path) as connection:
-        return _metadata(connection)
-
-
-# ---------------------------------------------------------------------------
-# OpenhouseFX UI. The engine above is independent of Streamlit and testable.
-# ---------------------------------------------------------------------------
 import base64
 import hashlib
 import html
+import json
+import math
 import os
 import shutil
+import sqlite3
 import tempfile
+import threading
+import time
+import uuid
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 import streamlit as st
 
+from verifier import (
+    FIELD_LABELS,
+    RESULT_COLUMNS,
+    DomainResult,
+    VerifyOptions,
+    distinct_values,
+    export_view_csv,
+    generate_organized_xlsx,
+    generate_xlsx,
+    group_counts,
+    inspect_input,
+    load_summary,
+    read_results,
+    run_verification,
+)
+from verifier import __version__ as APP_VERSION
+from verifier.enrich import country_name
+from verifier.phone import supported_regions, twilio_ready
+
 APP_ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2.0.0"
-_xlsx_lock = threading.Lock()
+_file_lock = threading.Lock()
+
+# Re-exported for scripts/tests that import the app module directly.
+__all__ = ["run_verification", "read_results", "DomainResult", "generate_xlsx", "main"]
 
 
+# --------------------------------------------------------------------------- styling
 @lru_cache(maxsize=1)
 def brand_css():
     """Embed the original Pocket Studio fonts, with no third-party font calls."""
     faces = []
-    for family, filename in [
-        ("Inter", "inter-latin.woff2"),
-        ("Plus Jakarta Sans", "jakarta-latin.woff2"),
-    ]:
-        encoded = base64.b64encode(
-            (APP_ROOT / "static" / filename).read_bytes()
-        ).decode("ascii")
+    for family, filename in [("Inter", "inter-latin.woff2"), ("Plus Jakarta Sans", "jakarta-latin.woff2")]:
+        encoded = base64.b64encode((APP_ROOT / "static" / filename).read_bytes()).decode("ascii")
         faces.append(
-            f"@font-face{{font-family:'{family}';src:url(data:font/woff2;base64,{encoded}) format('woff2');font-weight:100 900;font-style:normal;font-display:swap;}}"
+            f"@font-face{{font-family:'{family}';src:url(data:font/woff2;base64,{encoded}) format('woff2');"
+            "font-weight:100 900;font-style:normal;font-display:swap;}"
         )
     return "<style>" + "".join(faces) + """
-    :root {--navy:#061521;--card:#0B1F30;--panel:#0F2A40;--gold:#D3AA4E;--text:#F0F4F8;--muted:#94A3B8;--line:rgba(211,170,78,.19)}
+    :root {--navy:#061521;--card:#0B1F30;--panel:#0F2A40;--gold:#D3AA4E;--text:#F0F4F8;--muted:#94A3B8;--line:rgba(211,170,78,.19);--good:#14B8A6;--review:#D3AA4E;--bad:#F87171}
     html,body,[data-testid="stApp"] {font-family:Inter,sans-serif;color:var(--text);background:var(--navy)}
     h1,h2,h3,h4 {font-family:'Plus Jakarta Sans',Inter,sans-serif!important;letter-spacing:-.04em}
     [data-testid="stHeader"] {background:rgba(6,21,33,.94);border-bottom:1px solid rgba(211,170,78,.08)}
-    [data-testid="stSidebar"] {background:var(--card);border-right:1px solid var(--line);min-width:290px;max-width:290px}
-    [data-testid="stSidebarUserContent"] {padding:1.5rem 1.5rem 2rem}
+    [data-testid="stSidebar"] {background:var(--card);border-right:1px solid var(--line);min-width:300px;max-width:300px}
+    [data-testid="stSidebarUserContent"] {padding:1.5rem 1.4rem 2rem}
     [data-testid="stMainBlockContainer"] {max-width:1500px;padding:2rem 3.2rem}
     [data-testid="stVerticalBlock"] {gap:1rem}
-    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap:.85rem}
-    .brand {display:flex;align-items:center;gap:12px;padding:8px 0 28px;border-bottom:1px solid var(--line);margin-bottom:18px}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap:.8rem}
+    .brand {display:flex;align-items:center;gap:12px;padding:8px 0 26px;border-bottom:1px solid var(--line);margin-bottom:16px}
     .brand svg {width:29px;height:36px;flex:none}
     .wordmark {font:600 16px/1.3 Inter,sans-serif;letter-spacing:1.7px;white-space:nowrap}
     .wordmark span {color:var(--gold)}
     .product {font:500 7.7px/1.5 Inter,sans-serif;letter-spacing:3px;color:var(--gold);margin-top:5px}
-    .eyebrow {color:var(--gold);font:600 9px/1.5 Inter,sans-serif;letter-spacing:2.2px;margin:8px 0 14px;text-transform:uppercase}
-    .sidebar-title {font:600 18px/1.4 'Plus Jakarta Sans',sans-serif;letter-spacing:-.6px;margin-bottom:8px}
+    .eyebrow {color:var(--gold);font:600 9px/1.5 Inter,sans-serif;letter-spacing:2.2px;margin:8px 0 10px;text-transform:uppercase}
+    .sidebar-title {font:600 18px/1.4 'Plus Jakarta Sans',sans-serif;letter-spacing:-.6px;margin-bottom:6px}
     .small-copy {font:400 11px/1.8 Inter,sans-serif;color:var(--muted)}
-    .crumbs {display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(211,170,78,.10);padding:0 0 22px;margin-bottom:32px;gap:12px}
+    .crumbs {display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(211,170,78,.10);padding:0 0 22px;margin-bottom:30px;gap:12px}
     .crumbs-label {font-size:11px;color:var(--muted)}
     .crumbs-label b {color:#d9e2ec;font-weight:500;margin-left:16px}
     .local-pill {font-size:10px;color:var(--muted);border:1px solid rgba(148,163,184,.14);border-radius:30px;padding:7px 12px;white-space:nowrap}
     .local-pill i {display:inline-block;width:6px;height:6px;background:#14B8A6;border-radius:50%;margin-right:7px;box-shadow:0 0 9px #14b8a64d}
     .hero-title {font:500 clamp(28px,3vw,43px)/1.22 'Plus Jakarta Sans',sans-serif;letter-spacing:-.035em;word-spacing:.08em;margin:0 0 14px}
     .hero-title span {color:var(--gold)}
-    .hero-copy {font:400 12px/1.8 Inter,sans-serif;color:var(--muted);margin:0 0 16px}
+    .hero-copy {font:400 12px/1.8 Inter,sans-serif;color:var(--muted);margin:0 0 16px;max-width:760px}
     .section-title {font:600 19px/1.4 'Plus Jakarta Sans',sans-serif;letter-spacing:-.6px;margin:2px 0 4px}
     .section-note {font-size:11px;line-height:1.8;color:var(--muted);margin-bottom:12px}
-    .metric-grid {display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:12px 0 22px}
-    .kpi {background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px 17px 17px;min-height:117px}
-    .kpi-label {font-size:10px;font-weight:400;color:#a9bacb;white-space:nowrap}
-    .kpi-value {font:600 28px/1.5 'Plus Jakarta Sans',sans-serif;color:var(--gold);letter-spacing:-.6px}
+    .metric-grid {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 22px}
+    .kpi {background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 16px 15px;min-height:112px}
+    .kpi-label {font-size:10px;font-weight:400;color:#a9bacb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .kpi-value {font:600 27px/1.5 'Plus Jakarta Sans',sans-serif;color:var(--gold);letter-spacing:-.6px}
+    .kpi-value.good {color:var(--good)} .kpi-value.bad {color:var(--bad)}
     .kpi-note {font-size:9px;color:var(--muted);line-height:1.5}
+    .chips {display:flex;flex-wrap:wrap;gap:8px;margin:-8px 0 16px}
+    .chip {font-size:10px;color:#cbd5e1;border:1px solid rgba(148,163,184,.18);border-radius:20px;padding:5px 11px;background:rgba(15,42,64,.35)}
+    .chip b {color:var(--gold);font-weight:600;margin-right:4px}
     .workspace-empty {background:linear-gradient(115deg,#0B1F30,#081a29);border:1px solid var(--line);border-radius:12px;padding:34px 28px;text-align:center;margin:3px 0 18px}
     .empty-icon {display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border:1px solid rgba(211,170,78,.25);border-radius:12px;color:var(--gold);margin-bottom:16px}
     .empty-icon svg {width:21px;height:21px}
     .empty-title {font:500 20px/1.5 'Plus Jakarta Sans',sans-serif;letter-spacing:-.6px;margin-bottom:7px}
-    .empty-copy {font-size:11px;line-height:1.9;color:var(--muted);max-width:410px;margin:auto}
-    .step {display:flex;gap:12px;align-items:flex-start;margin:18px 0}
+    .empty-copy {font-size:11px;line-height:1.9;color:var(--muted);max-width:470px;margin:auto}
+    .step {display:flex;gap:12px;align-items:flex-start;margin:14px 0}
     .step-num {color:var(--gold);font-size:10px;border:1px solid rgba(211,170,78,.2);border-radius:6px;padding:5px}
     .step strong {font-size:11px;font-weight:500;display:block;margin-bottom:4px}
     .step p {font-size:10px;color:var(--muted);margin:0;line-height:1.7}
     .run-label {font-size:10px;color:var(--muted);margin-top:8px;line-height:1.8;word-break:break-word}
     .footer-note {border-top:1px solid rgba(211,170,78,.10);margin-top:25px;padding-top:18px;display:flex;justify-content:space-between;font-size:9px;letter-spacing:.3px;color:var(--muted);gap:10px}
-    .sidebar-footer {padding-top:22px;border-top:1px solid var(--line);margin-top:24px}
+    .sidebar-footer {padding-top:20px;border-top:1px solid var(--line);margin-top:20px}
     [data-testid="stFileUploaderDropzone"] {background:rgba(15,42,64,.4);border:1px dashed rgba(211,170,78,.38);border-radius:9px;padding:20px 18px}
     [data-testid="stFileUploaderDropzone"] p {font-size:12px}
     [data-testid="stFileUploaderDropzone"] small {color:var(--muted);font-size:10px}
@@ -973,7 +115,7 @@ def brand_css():
     [data-testid="stWidgetLabel"] p {font-size:11px!important;font-weight:400!important;color:#a9bacb}
     [data-testid="stCaptionContainer"] p {font-size:10px!important;line-height:1.8;color:var(--muted)}
     [data-testid="stBaseButton-primary"] {background:linear-gradient(120deg,#D3AA4E,#c79b39)!important;color:#061521!important;border:1px solid #d3aa4e!important;min-height:42px;border-radius:8px!important;font-weight:600;box-shadow:0 4px 18px #d3aa4e1c}
-    [data-testid="stBaseButton-primary"]:hover {background:#C2993D!important;border-color:#e2bc65!important;box-shadow:0 4px 22px #d3aa4e30}
+    [data-testid="stBaseButton-primary"]:hover {background:#C2993D!important;border-color:#e2bc65!important}
     [data-testid="stBaseButton-primary"] p {color:#061521!important;font-size:11px!important;font-weight:600}
     button {font-family:Inter,sans-serif!important;transition:background .16s ease,border-color .16s ease}
     [data-testid="stBaseButton-secondary"] {border-color:rgba(211,170,78,.22);background:rgba(15,42,64,.3);border-radius:8px;min-height:39px}
@@ -984,31 +126,69 @@ def brand_css():
     [data-testid="stAlert"] p {font-size:11px;line-height:1.8}
     [data-testid="stExpander"] {border-color:var(--line);border-radius:8px}
     [data-testid="stExpander"] summary p {font-size:11px}
+    [data-baseweb="tab-list"] button p {font-size:12px}
     .stAppDeployButton {display:none}
     button:focus-visible,input:focus-visible {outline:2px solid var(--gold)!important;outline-offset:3px}
-    @media(max-width:1100px){[data-testid="stMainBlockContainer"]{padding:2rem 1.5rem}.kpi{padding:15px 11px}.kpi-label{font-size:9px}.kpi-value{font-size:25px}}
-    @media(max-width:1000px){.metric-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.kpi{padding:16px}.kpi-label{font-size:10px}}
-    @media(max-width:700px){[data-testid="stMainBlockContainer"]{padding:1.4rem 1rem}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.kpi:last-child{grid-column:1/-1}.kpi{min-height:100px}.hero-title{letter-spacing:-1px}.crumbs{margin-bottom:22px}.crumbs-label b{margin-left:8px}.local-pill{font-size:9px;padding:6px 9px}.workspace-empty{padding:26px 18px}.footer-note{flex-direction:column}}
+    @media(max-width:1200px){[data-testid="stMainBlockContainer"]{padding:2rem 1.5rem}.metric-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media(max-width:700px){[data-testid="stMainBlockContainer"]{padding:1.4rem 1rem}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.kpi{min-height:96px}.crumbs{margin-bottom:22px}.crumbs-label b{margin-left:8px}.workspace-empty{padding:26px 18px}.footer-note{flex-direction:column}}
     </style>"""
 
 
-def show_metrics(counts):
+# --------------------------------------------------------------------------- helpers
+def show_metrics(counts, checks=None):
+    checks = checks or {"email": True, "phone": False}
+    total = counts.get("total", 0)
+
+    def pct(key):
+        return f"{counts.get(key, 0) / total:.0%} of leads" if total else ""
+
     cards = [
-        ("Total processed", "total", "Rows in this run"),
-        ("Valid emails", "valid", "Syntax + MX checks passed"),
-        ("Invalid domains", "invalid_domains", "No usable mail route"),
-        ("Role accounts", "role", "Generic business inboxes"),
-        ("Disposable / risky", "risky", "Review before use"),
+        ("Total leads", f"{total:,}", "", "Rows in this run"),
+        ("Good leads", f"{counts.get('good', 0):,}", "good", pct("good") or "Ready to contact"),
+        ("Needs review", f"{counts.get('review', 0):,}", "", pct("review") or "Check before use"),
+        ("Bad leads", f"{counts.get('bad', 0):,}", "bad", pct("bad") or "Remove or fix"),
     ]
+    if checks.get("email", True):
+        cards.append(("Valid emails", f"{counts.get('valid', 0):,}",
+                      "", f"{counts.get('mailbox_exists', 0):,} mailboxes confirmed"))
+    if checks.get("phone"):
+        cards.append(("Valid phones", f"{counts.get('phone_valid', 0):,}", "",
+                      f"{counts.get('phone_invalid', 0):,} invalid · {counts.get('phone_missing', 0):,} missing"))
+    elif len(cards) < 6:
+        cards.append(("Duplicates", f"{counts.get('duplicates', 0):,}", "", "Repeat emails in the list"))
     st.markdown(
         '<div class="metric-grid">'
         + "".join(
-            f'<div class="kpi"><div class="kpi-label">{label}</div><div class="kpi-value">{counts.get(key,0):,}</div><div class="kpi-note">{note}</div></div>'
-            for label, key, note in cards
+            f'<div class="kpi"><div class="kpi-label">{label}</div><div class="kpi-value {cls}">{value}</div>'
+            f'<div class="kpi-note">{note}</div></div>'
+            for label, value, cls, note in cards
         )
         + "</div>",
         unsafe_allow_html=True,
     )
+
+
+def show_chips(counts, checks):
+    chips = []
+    if checks.get("email"):
+        chips += [("Duplicates", counts.get("duplicates", 0)), ("Role inboxes", counts.get("role", 0)),
+                  ("Disposable", counts.get("disposable", 0)), ("Typos", counts.get("typos", 0)),
+                  ("Free providers", counts.get("free", 0))]
+        if checks.get("smtp"):
+            chips += [("Mailbox missing", counts.get("mailbox_missing", 0)), ("Catch-all", counts.get("catch_all", 0)),
+                      ("Unverifiable", counts.get("mailbox_unverifiable", 0))]
+    if checks.get("phone"):
+        chips += [("Duplicate phones", counts.get("phone_duplicates", 0))]
+        if checks.get("line"):
+            chips += [("Lines active", counts.get("line_active", 0)), ("Lines dead", counts.get("line_inactive", 0))]
+    if checks.get("activity"):
+        chips += [("Active", counts.get("active", 0)), ("Lapsing", counts.get("lapsing", 0)),
+                  ("Inactive", counts.get("inactive", 0))]
+    if chips:
+        st.markdown(
+            '<div class="chips">' + "".join(f'<span class="chip"><b>{n:,}</b>{html.escape(l)}</span>' for l, n in chips) + "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def get_workspace():
@@ -1030,6 +210,21 @@ def load_disposable_domains():
     )
 
 
+@lru_cache(maxsize=1)
+def region_options():
+    regions = supported_regions()
+    names = {code: country_name(code) for code in regions}
+    return sorted(regions, key=lambda code: names[code]), names
+
+
+def _env_flag(name, default):
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+# --------------------------------------------------------------------------- optional integrations
 def supabase_ready():
     return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_KEY"))
 
@@ -1039,9 +234,7 @@ def log_run_metadata(summary):
     url = os.environ.get("SUPABASE_URL", "").rstrip("/")
     key = os.environ.get("SUPABASE_KEY", "")
     if urlparse(url).scheme != "https" or not urlparse(url).hostname or not key:
-        raise ValueError(
-            "Supabase requires an HTTPS project URL and a server-side key."
-        )
+        raise ValueError("Supabase requires an HTTPS project URL and a server-side key.")
     payload = {
         "batch_id": summary["batch_id"],
         "total_validated": summary["counts"]["total"],
@@ -1051,11 +244,8 @@ def log_run_metadata(summary):
     response = requests.post(
         url + "/rest/v1/verifier_runs",
         json=payload,
-        headers={
-            "apikey": key,
-            "Authorization": "Bearer " + key,
-            "Prefer": "resolution=merge-duplicates,return=minimal",
-        },
+        headers={"apikey": key, "Authorization": "Bearer " + key,
+                 "Prefer": "resolution=merge-duplicates,return=minimal"},
         timeout=(3, 7),
     )
     response.raise_for_status()
@@ -1069,12 +259,8 @@ def save_completed_run(summary):
     shutil.copytree(Path(summary["db_path"]).parent, target)
     saved = dict(summary)
     saved["db_path"] = str(target / Path(summary["db_path"]).name)
-    saved["exports"] = {
-        key: str(target / Path(value).name) for key, value in summary["exports"].items()
-    }
-    (target / "manifest.json").write_text(
-        json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    saved["exports"] = {key: str(target / Path(value).name) for key, value in summary["exports"].items()}
+    (target / "manifest.json").write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
     return token
 
 
@@ -1083,78 +269,104 @@ def restore_completed_run(token):
     directory = Path(os.environ["VERIFIER_DATA_DIR"]).expanduser().resolve() / token
     saved = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     saved["db_path"] = str(directory / Path(saved["db_path"]).name)
-    saved["exports"] = {
-        key: str(directory / Path(value).name)
-        for key, value in saved["exports"].items()
-    }
-    if not Path(saved["db_path"]).is_file() or not all(
-        Path(value).is_file() for value in saved["exports"].values()
-    ):
+    saved["exports"] = {key: str(directory / Path(value).name) for key, value in saved["exports"].items()}
+    if not Path(saved["db_path"]).is_file() or not all(Path(v).is_file() for v in saved["exports"].values()):
         raise ValueError("The saved results could not be found.")
     try:
         completed = load_summary(saved["db_path"])
-        if (
-            completed["batch_id"] != saved["batch_id"]
-            or completed["counts"] != saved["counts"]
-        ):
+        if completed["batch_id"] != saved["batch_id"] or completed["counts"] != saved["counts"]:
             raise ValueError("Saved run metadata does not match its results.")
     except (sqlite3.Error, KeyError) as exc:
-        raise ValueError(
-            "The saved result database is incomplete or unreadable."
-        ) from exc
+        raise ValueError("The saved result database is incomplete or unreadable.") from exc
     return saved
 
 
+# --------------------------------------------------------------------------- sidebar
 def render_sidebar():
     with st.sidebar:
-        house = (APP_ROOT / "assets" / "openhousefx-house.svg").read_text(
-            encoding="utf-8"
-        )
+        house = (APP_ROOT / "assets" / "openhousefx-house.svg").read_text(encoding="utf-8")
         st.markdown(
-            f'<div class="brand">{house}<div><div class="wordmark">OPENHOUSE<span>FX</span></div><div class="product">LEAD VERIFIER</div></div></div>',
+            f'<div class="brand">{house}<div><div class="wordmark">OPENHOUSE<span>FX</span></div>'
+            '<div class="product">LEAD VERIFIER</div></div></div>',
             unsafe_allow_html=True,
         )
         st.markdown(
-            '<div class="eyebrow">01 / CONFIGURE YOUR RUN</div><div class="sidebar-title">Verification settings</div><div class="small-copy">A considered check. A cleaner list.</div>',
+            '<div class="eyebrow">01 / CONFIGURE YOUR RUN</div><div class="sidebar-title">Verification settings</div>'
+            '<div class="small-copy">Turn on the deep checks for the most accurate verdicts.</div>',
             unsafe_allow_html=True,
         )
-        workers = st.select_slider(
-            "Concurrent domain checks",
-            options=[20, 25, 30, 35, 40, 45, 50],
-            value=35,
-            key="workers",
-            help="Each unique domain is checked once per run. DNS queries share a two-second budget per domain.",
+        smtp = st.toggle(
+            "Mailbox check (SMTP)",
+            value=_env_flag("VERIFIER_SMTP_DEFAULT", True),
+            key="opt_smtp",
+            help="Asks each mail server whether the exact mailbox exists, without sending an email. "
+            "Also detects catch-all domains. Needs outbound port 25; skipped automatically where the host blocks it.",
         )
-        batch_size = st.selectbox(
-            "Rows per batch",
-            [1000, 2000, 5000],
-            index=1,
-            key="batch_size",
-            format_func=lambda n: f"{n:,} rows",
-        )
-        st.caption(
-            "Duplicates are tagged automatically. Role and disposable addresses are set aside for review."
-        )
-        with st.expander("How results are classified"):
-            st.markdown(
-                "**Valid** · Syntax and MX records pass, with no list hygiene flags.\n\n**Invalid** · Invalid syntax, duplicate entry, nonexistent domain or no mail route.\n\n**Risky** · Role inbox, disposable provider, DNS uncertainty or A/AAAA fallback."
-            )
+        if smtp:
             st.caption(
-                "Valid describes these checks. Mailbox existence, catch-all status and actual delivery are not tested."
+                "Mailbox checks use the ZeroBounce API when port 25 is blocked."
+                if os.environ.get("ZEROBOUNCE_API_KEY")
+                else "Needs a server with outbound port 25 open (not Render). Skipped automatically if blocked."
             )
-        st.markdown(
-            '<div class="eyebrow" style="margin-top:22px">YOUR WORKFLOW</div><div class="step"><div class="step-num">01</div><div><strong>Bring your lead sheet</strong><p>CSV or Excel. Original columns stay with you.</p></div></div><div class="step"><div class="step-num">02</div><div><strong>Check with confidence</strong><p>Syntax, duplicates and domain records.</p></div></div><div class="step"><div class="step-num">03</div><div><strong>Review. Then export.</strong><p>A full report or just the leads you need.</p></div></div>',
-            unsafe_allow_html=True,
+        strict = st.toggle(
+            "Strict mode",
+            value=_env_flag("VERIFIER_STRICT_DEFAULT", False),
+            key="opt_strict",
+            disabled=not smtp,
+            help="Only emails whose mailbox the mail server confirmed can be graded Good. "
+            "Valid-but-unconfirmed emails move to Review.",
         )
+        domain_age = st.toggle(
+            "Company domain age",
+            value=_env_flag("VERIFIER_DOMAIN_AGE_DEFAULT", True),
+            key="opt_age",
+            help="Looks up when the lead's company website/email domain was registered (RDAP). Free providers like Gmail are skipped.",
+        )
+        line_ok = twilio_ready()
+        line = st.toggle(
+            "Live phone line status",
+            value=False,
+            key="opt_line",
+            disabled=not line_ok,
+            help="Uses Twilio Lookup to report whether each number is active, inactive or unreachable (billed per lookup by Twilio).",
+        )
+        if not line_ok:
+            st.caption("Live line status needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server. Offline phone validation always runs.")
+        regions, names = region_options()
+        default_region = os.environ.get("VERIFIER_DEFAULT_REGION", "US").upper()
+        region = st.selectbox(
+            "Default phone country",
+            regions,
+            index=regions.index(default_region) if default_region in regions else regions.index("US"),
+            format_func=lambda code: f"{names[code]} ({code})",
+            key="opt_region",
+            help="Used for numbers written without a +country code when the row has no country.",
+        )
+        dayfirst = st.checkbox("Dates are day-first (DD/MM/YYYY)", value=False, key="opt_dayfirst")
+        col1, col2 = st.columns(2)
+        with col1:
+            active_days = st.number_input("Active within (days)", 1, 3650, 90, key="opt_active")
+        with col2:
+            inactive_days = st.number_input("Inactive after (days)", 1, 7300, 365, key="opt_inactive")
+        with st.expander("Speed & batch size"):
+            workers = st.select_slider("Concurrent domain checks", options=[10, 20, 25, 30, 35, 40, 45, 50], value=35, key="workers")
+            smtp_workers = st.select_slider("Concurrent mailbox checks", options=[2, 4, 6, 8, 10, 12, 16, 20], value=10, key="smtp_workers")
+            batch_size = st.selectbox("Rows per batch", [1000, 2000, 5000], index=1, key="batch_size",
+                                      format_func=lambda n: f"{n:,} rows")
+        with st.expander("How leads are graded"):
+            st.markdown(
+                "**Good** · Email valid (mailbox confirmed or domain working) and no bad phone.\n\n"
+                "**Review** · Risky email (catch-all, role inbox, typo, DNS doubt) or a bad phone next to a good email, "
+                "or only the phone works.\n\n"
+                "**Bad** · Invalid/duplicate email, mailbox doesn't exist, disposable or placeholder address, and no working phone.\n\n"
+                "**Lead score** · 0–100 combining email (70%) and phone (30%) quality, minus points for inactive clients."
+            )
         persist = log_metadata = False
         if os.environ.get("VERIFIER_DATA_DIR") or supabase_ready():
             with st.expander("Save & recovery"):
                 if os.environ.get("VERIFIER_DATA_DIR"):
-                    persist = st.checkbox(
-                        "Save this run on the server",
-                        value=False,
-                        help="Saves lead rows and reports to the configured disk. Your private recovery code restores them after a reload. Keep it private.",
-                    )
+                    persist = st.checkbox("Save this run on the server", value=False,
+                                          help="Saves lead rows and reports to the configured disk. Keep the recovery code private.")
                     with st.form("restore_run"):
                         token = st.text_input("Recovery code", type="password")
                         restore = st.form_submit_button("Restore saved run")
@@ -1164,27 +376,30 @@ def render_sidebar():
                             st.session_state.result_source = None
                             st.session_state.restored = True
                             st.session_state.pop("run_messages", None)
-                            st.session_state.recovery_code = uuid.UUID(
-                                token.strip()
-                            ).hex
+                            st.session_state.recovery_code = uuid.UUID(token.strip()).hex
                             st.rerun()
                         except (ValueError, OSError, KeyError, json.JSONDecodeError):
                             st.error("No completed run found for that recovery code.")
                 if supabase_ready():
-                    log_metadata = st.checkbox(
-                        "Log run totals to Supabase",
-                        value=False,
-                        help="Sends only the batch ID, timestamp and counts. Lead rows and filenames are not sent.",
-                    )
+                    log_metadata = st.checkbox("Log run totals to Supabase", value=False,
+                                               help="Sends only the batch ID, timestamp and counts.")
         st.markdown(
-            f'<div class="sidebar-footer"><div class="small-copy">OPENHOUSEFX · POCKET STUDIO</div><div class="small-copy">Lead Verifier {APP_VERSION}</div></div>',
+            f'<div class="sidebar-footer"><div class="small-copy">OPENHOUSEFX · POCKET STUDIO</div>'
+            f'<div class="small-copy">Lead Verifier {APP_VERSION}</div></div>',
             unsafe_allow_html=True,
         )
-    return workers, batch_size, persist, log_metadata
+    options = VerifyOptions(
+        smtp_check=bool(smtp), domain_age=bool(domain_age), line_check=bool(line and line_ok),
+        default_region=region, dayfirst=bool(dayfirst), active_days=int(active_days),
+        inactive_days=max(int(inactive_days), int(active_days)), smtp_workers=int(smtp_workers),
+        strict=bool(smtp and strict),
+    )
+    return {"workers": workers, "batch_size": batch_size, "options": options,
+            "persist": persist, "log_metadata": log_metadata}
 
 
+# --------------------------------------------------------------------------- input
 def stage_upload(uploaded, workspace):
-    """Hash a memoryview without allocating a second upload-sized buffer."""
     buffer = uploaded.getbuffer()
     try:
         signature = (hashlib.sha256(buffer).hexdigest(), uploaded.name)
@@ -1192,14 +407,7 @@ def stage_upload(uploaded, workspace):
             target = workspace / ("source" + Path(uploaded.name).suffix.lower())
             with target.open("wb") as handle:
                 handle.write(buffer)
-            for key in (
-                "result",
-                "input_info",
-                "sheet_choice",
-                "restored",
-                "run_messages",
-                "recovery_code",
-            ):
+            for key in ("result", "input_info", "sheet_choice", "restored", "run_messages", "recovery_code"):
                 st.session_state.pop(key, None)
             st.session_state.upload_signature = signature
             st.session_state.input_path = str(target)
@@ -1208,17 +416,26 @@ def stage_upload(uploaded, workspace):
         buffer.release()
 
 
+def _column_picker(label, field, columns, default, key):
+    options = [None] + list(range(len(columns)))
+    return st.selectbox(
+        label,
+        options,
+        index=(int(default) + 1 if default is not None else 0),
+        format_func=lambda i: "— Not in this file —" if i is None else columns[i],
+        key=key,
+    )
+
+
 def render_input(workspace):
     st.markdown(
-        '<div class="section-title">Your source file</div><div class="section-note">Start with your lead sheet. We’ll keep its original columns in every report.</div>',
+        '<div class="section-title">Your source file</div><div class="section-note">Upload a lead sheet. '
+        "Every original column stays in every report.</div>",
         unsafe_allow_html=True,
     )
     uploaded = st.file_uploader(
-        "Upload a lead sheet",
-        type=["csv", "xlsx", "xls"],
-        key="source_upload",
-        label_visibility="collapsed",
-        help="Maximum 50 MB. CSV is read in chunks; XLSX is streamed. Legacy XLS uses a sheet reader.",
+        "Upload a lead sheet", type=["csv", "xlsx", "xls"], key="source_upload", label_visibility="collapsed",
+        help="CSV, XLSX or XLS up to 50 MB. The first row must be the column headers.",
     )
     if uploaded is None:
         if st.session_state.pop("upload_signature", None) is not None:
@@ -1231,9 +448,7 @@ def render_input(workspace):
     try:
         if "input_info" not in st.session_state:
             with st.spinner("Reading your file…"):
-                st.session_state.input_info = inspect_input(
-                    path, filename=uploaded.name
-                )
+                st.session_state.input_info = inspect_input(path, filename=uploaded.name)
         info = st.session_state.input_info
         sheets = info.get("sheets", [])
         sheet = None
@@ -1244,32 +459,33 @@ def render_input(workspace):
                     info = inspect_input(path, filename=uploaded.name, sheet_name=sheet)
                     st.session_state.input_info = info
         columns = info["columns"]
-        default = info.get("email_index")
-        mapping_key = "mapping_" + signature[0][:12] + "_" + str(sheet)
-        left, right = st.columns([1.5, 1])
+        detected = info.get("detected", {})
+        prefix = "map_" + signature[0][:12] + "_" + str(sheet) + "_"
+        left, middle, right = st.columns([1.2, 1.2, 1])
         with left:
-            email_index = st.selectbox(
-                "Email column",
-                [None] + list(range(len(columns))),
-                index=(int(default) + 1 if default is not None else 0),
-                format_func=lambda i: (
-                    "Choose an email column…" if i is None else columns[i]
-                ),
-                key=mapping_key,
-            )
+            email_index = _column_picker("Email column", "email", columns, detected.get("email"), prefix + "email")
+        with middle:
+            phone_index = _column_picker("Phone column", "phone", columns, detected.get("phone"), prefix + "phone")
         with right:
             st.markdown(
-                f'<div class="run-label">FILE READY<br><span style="color:#F0F4F8">{html.escape(uploaded.name)}</span><br>{info.get("row_count",0):,} rows · {len(columns)} columns</div>',
+                f'<div class="run-label">FILE READY<br><span style="color:#F0F4F8">{html.escape(uploaded.name)}</span>'
+                f'<br>{info.get("row_count", 0):,} rows · {len(columns)} columns</div>',
                 unsafe_allow_html=True,
             )
-        if default is None:
-            st.caption("Choose the column containing email addresses to continue.")
+        mapping = {"email": email_index, "phone": phone_index}
+        extra = [field for field in FIELD_LABELS if field not in ("email", "phone")]
+        found = sum(1 for field in extra if detected.get(field) is not None)
+        with st.expander(f"More columns · {found} auto-detected (name, location, dates, company)", expanded=False):
+            st.caption("Map these to unlock name sorting, country/state grouping, client age and activity status.")
+            grid = st.columns(3)
+            for position, field in enumerate(extra):
+                with grid[position % 3]:
+                    mapping[field] = _column_picker(FIELD_LABELS[field], field, columns, detected.get(field), prefix + field)
+        if email_index is None and phone_index is None:
+            st.caption("Choose an email column or a phone column to continue.")
         return {
-            "path": path,
-            "filename": uploaded.name,
-            "sheet": sheet,
-            "email_index": email_index,
-            "signature": (signature, sheet, email_index),
+            "path": path, "filename": uploaded.name, "sheet": sheet, "mapping": mapping,
+            "signature": (signature, sheet, tuple(sorted((k, v) for k, v in mapping.items() if v is not None))),
             "info": info,
         }
     except Exception as exc:
@@ -1277,62 +493,60 @@ def render_input(workspace):
         return None
 
 
-def execute_run(source, workers, batch_size, persist, log_metadata, metrics_slot):
+def execute_run(source, settings, metrics_slot):
     run_dir = get_workspace() / uuid.uuid4().hex
     progress_bar = st.progress(0, text="Preparing your list…")
     detail = st.empty()
     last_update = [0.0]
+    stages = {
+        "Checking email domains": "Checking email domains",
+        "Checking mailboxes": "Asking mail servers if each mailbox exists",
+        "Looking up company domain ages": "Looking up company domain ages",
+        "Checking phone lines": "Checking phone lines",
+        "Verifying rows": "Grading leads",
+    }
 
     def report(event):
-        # Engine callbacks run on the main Streamlit thread, never DNS workers.
         now = time.monotonic()
         stage = event.get("stage", "")
-        if now - last_update[0] < 0.15 and stage not in {
-            "Complete",
-            "Preparing exports",
-        }:
+        if now - last_update[0] < 0.2 and stage not in {"Complete", "Preparing exports"}:
             return
         last_update[0] = now
         done = event.get("rows_processed", 0)
         total = event.get("total_rows") or source["info"].get("row_count") or 0
         fraction = min(done / total, 1) if total else 0
         eta = event.get("eta")
-        eta_text = (
-            f" · About {max(1,round(eta)):,}s remaining"
-            if eta is not None and done < total
-            else ""
-        )
-        label = (
-            "Preparing your exports…"
-            if stage == "Preparing exports"
-            else f"{fraction:.0%} · {done:,} of {total:,} rows{eta_text}"
+        eta_text = f" · about {max(1, round(eta)):,}s left" if eta is not None and done < total else ""
+        label = "Preparing your exports…" if stage == "Preparing exports" else (
+            f"{fraction:.0%} · {done:,} of {total:,} rows{eta_text}"
         )
         progress_bar.progress(fraction, text=label)
+        note = event.get("note") or ""
         detail.caption(
-            f'{event.get("domains_checked",0):,} unique domains checked · {event.get("elapsed",0):.1f}s elapsed'
+            f'{stages.get(stage, stage)} · {event.get("domains_checked", 0):,} domains checked · '
+            f'{event.get("elapsed", 0):.1f}s elapsed' + (f" · {note}" if note else "")
         )
         if event.get("counts"):
             with metrics_slot.container():
-                show_metrics(event["counts"])
+                show_metrics(event["counts"], {"email": source["mapping"].get("email") is not None,
+                                               "phone": source["mapping"].get("phone") is not None})
 
     try:
         summary = run_verification(
-            source["path"],
-            run_dir,
-            source["email_index"],
-            workers=workers,
-            batch_size=batch_size,
+            source["path"], run_dir,
+            mapping=source["mapping"],
+            workers=settings["workers"],
+            batch_size=settings["batch_size"],
             sheet_name=source["sheet"],
             filename=source["filename"],
             disposable_domains=load_disposable_domains(),
+            options=settings["options"],
             progress=report,
         )
     except Exception as exc:
         progress_bar.empty()
         detail.empty()
-        st.error(
-            f"Verification could not finish: {exc}. Any previous completed report remains available."
-        )
+        st.error(f"Verification could not finish: {exc}. Any previous completed report remains available.")
         return
     summary["source_name"] = source["filename"]
     st.session_state.result = summary
@@ -1340,194 +554,319 @@ def execute_run(source, workers, batch_size, persist, log_metadata, metrics_slot
     st.session_state.pop("restored", None)
     st.session_state.pop("recovery_code", None)
     messages = []
-    if persist:
+    if settings["persist"]:
         try:
             st.session_state.recovery_code = save_completed_run(summary)
             messages.append("Saved on the configured server disk.")
         except (OSError, ValueError):
-            messages.append(
-                "Server save failed; download your reports before leaving this session."
-            )
-    if log_metadata:
+            messages.append("Server save failed; download your reports before leaving this session.")
+    if settings["log_metadata"]:
         try:
             log_run_metadata(summary)
             messages.append("Run totals logged to Supabase.")
         except (requests.RequestException, ValueError):
-            messages.append(
-                "Supabase logging failed; your verification results and downloads are ready."
-            )
+            messages.append("Supabase logging failed; your verification results and downloads are ready.")
     st.session_state.run_messages = messages
     progress_bar.empty()
     detail.empty()
     st.rerun()
 
 
+# --------------------------------------------------------------------------- results
 def download_file(path):
-    """Read only the requested export, on click, rather than all files on rerun."""
     return Path(path).read_bytes()
+
+
+def _relevant_columns(summary):
+    checks = summary.get("checks", {"email": True})
+    mapping = summary.get("mapping", {})
+    columns = ["Lead_Verdict", "Lead_Score", "Lead_Issues"]
+    if mapping.get("name") or mapping.get("first_name") or mapping.get("last_name"):
+        columns.append("Lead_Name")
+    if mapping.get("company"):
+        columns.append("Lead_Company")
+    columns += ["Lead_Country", "Lead_State"]
+    if checks.get("email"):
+        columns += ["Verification_Status", "Reason", "Mailbox_Check", "Normalized_Email", "Email_Domain",
+                    "DNS_Check", "MX_Host", "Is_Role", "Is_Disposable", "Is_Free_Provider", "Is_Duplicate",
+                    "Typo_Suggestion"]
+    if checks.get("phone"):
+        columns += ["Phone_Status", "Phone_E164", "Phone_Type", "Phone_Country", "Phone_Carrier",
+                    "Phone_Location", "Phone_Line_Status", "Is_Duplicate_Phone"]
+    if checks.get("dob"):
+        columns.append("Age")
+    if checks.get("created"):
+        columns += ["Record_Age_Days", "Record_Age"]
+    if checks.get("activity"):
+        columns += ["Last_Activity_Days", "Activity_Status"]
+    if checks.get("domain_age"):
+        columns += ["Domain_Created", "Domain_Age_Years"]
+    return [column for column in RESULT_COLUMNS if column in columns]
+
+
+_PRETTY = {
+    "Lead_Verdict": "Verdict", "Lead_Score": "Score", "Lead_Issues": "Issues", "Lead_Name": "Name",
+    "Lead_Company": "Company", "Lead_Country": "Country", "Lead_State": "State",
+    "Verification_Status": "Email status", "Mailbox_Check": "Mailbox", "Phone_Status": "Phone status",
+    "Phone_E164": "Phone (intl.)", "Phone_Type": "Phone type", "Phone_Line_Status": "Line status",
+    "Record_Age": "Lead age", "Record_Age_Days": "Lead age (days)", "Last_Activity_Days": "Days since activity",
+    "Activity_Status": "Activity", "Domain_Age_Years": "Domain age (yrs)", "Domain_Created": "Domain registered",
+    "Age": "Age (yrs)",
+}
+
+
+def _label(column):
+    return _PRETTY.get(column, column.replace("_", " "))
+
+
+def _choice_label(column):
+    """Menu label; marks sheet columns whose name matches a verified column (e.g. 'State')."""
+    if column is None:
+        return "Original order"
+    if column in RESULT_COLUMNS:
+        label = _label(column)
+        return label + " (standardized)" if column in ("Lead_Country", "Lead_State", "Lead_Name", "Lead_Company") else label
+    return f"{column} (as in your sheet)"
+
+
+def _sort_choices(summary):
+    preferred = [c for c in ("Lead_Name", "Lead_Country", "Lead_State", "Lead_Score", "Lead_Verdict", "Lead_Company",
+                             "Age", "Record_Age_Days", "Last_Activity_Days", "Domain_Age_Years",
+                             "Verification_Status", "Phone_Status", "Email_Domain", "Activity_Status")
+                 if c in _relevant_columns(summary)]
+    return [None] + preferred + summary["original_columns"]
+
+
+def _group_choices(summary):
+    preferred = [c for c in ("Lead_Country", "Lead_State", "Lead_Verdict", "Verification_Status", "Activity_Status",
+                             "Phone_Type", "Phone_Country", "Phone_Status", "Email_Domain", "Lead_Company",
+                             "Mailbox_Check")
+                 if c in _relevant_columns(summary)]
+    return preferred + summary["original_columns"]
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _distinct(db_path, batch_id, column):
+    return distinct_values(db_path, column, limit=400)
+
+
+def _filter_widgets(summary, prefix):
+    checks = summary.get("checks", {})
+    statuses = ["All", "Good", "Review", "Bad"]
+    if checks.get("email"):
+        statuses += ["Valid", "Risky", "Invalid", "Duplicate", "Role / Disposable"]
+        if checks.get("smtp"):
+            statuses += ["Mailbox confirmed", "Catch-all"]
+    if checks.get("phone"):
+        statuses += ["Phone valid", "Phone invalid"]
+    if checks.get("activity"):
+        statuses += ["Active", "Lapsing", "Inactive"]
+    a, b, c, d = st.columns([1, 1, 1, 1.6])
+    with a:
+        status = st.selectbox("Show", statuses, key=prefix + "status")
+    with b:
+        countries = ["All"] + _distinct(summary["db_path"], summary["batch_id"], "Lead_Country")
+        country = st.selectbox("Country", countries, key=prefix + "country")
+    with c:
+        states = ["All"] + _distinct(summary["db_path"], summary["batch_id"], "Lead_State")
+        state = st.selectbox("State / province", states, key=prefix + "state")
+    with d:
+        search = st.text_input("Search", placeholder="Name, email, company, reason…", key=prefix + "search")
+    filters = {"Lead_Country": country, "Lead_State": state}
+    return status, search, filters
+
+
+def render_leads_tab(summary):
+    status, search, filters = _filter_widgets(summary, "leads_")
+    sort_options = _sort_choices(summary)
+    a, b, c, d = st.columns([1.4, 1, 0.8, 0.8])
+    with a:
+        sort_by = st.selectbox("Sort by", sort_options, key="leads_sort", format_func=_choice_label)
+    with b:
+        descending = st.selectbox("Order", ["Ascending (A→Z, low→high)", "Descending (Z→A, high→low)"],
+                                  key="leads_order").startswith("Desc")
+    with c:
+        limit = st.selectbox("Rows per page", [50, 100, 250, 500], index=1, key="page_size")
+    filter_key = (summary["batch_id"], status, search, json.dumps(filters), sort_by, descending, limit)
+    if st.session_state.get("last_filter") != filter_key:
+        st.session_state.report_page = 1
+        st.session_state.last_filter = filter_key
+    query = {"status": status, "search": search, "filters": filters, "sort_by": sort_by, "descending": descending}
+    _, total = read_results(summary["db_path"], limit=1, **query)
+    pages = max(1, math.ceil(total / limit))
+    with d:
+        page = st.number_input("Page", min_value=1, max_value=pages, step=1, key="report_page")
+    frame, total = read_results(summary["db_path"], limit=limit, offset=(page - 1) * limit, **query)
+    st.caption(f"{total:,} matching leads · page {page:,} of {pages:,}")
+    if total:
+        relevant = _relevant_columns(summary)
+        lead = ["Lead_Verdict", "Lead_Score", "Lead_Name"]
+        if summary.get("email_column"):
+            lead.append(summary["email_column"])
+        lead += ["Verification_Status", "Mailbox_Check"]
+        if summary.get("mapping", {}).get("phone"):
+            lead.append(summary["mapping"]["phone"])
+        lead += ["Phone_Status", "Phone_Type", "Lead_Country", "Lead_State", "Age", "Record_Age",
+                 "Activity_Status", "Domain_Age_Years", "Lead_Issues", "Reason"]
+        order = [c for c in dict.fromkeys(lead + summary["original_columns"] + relevant) if c in frame.columns
+                 and (c in summary["original_columns"] or c in relevant)]
+        config = {column: st.column_config.Column(_label(column)) for column in relevant}
+        config["Lead_Score"] = st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d")
+        config["Lead_Issues"] = st.column_config.TextColumn("Issues", width="large")
+        config["Reason"] = st.column_config.TextColumn("Email reason", width="large")
+        st.dataframe(frame, column_order=order, column_config=config, hide_index=True, width="stretch",
+                     height=min(520, max(180, len(frame) * 35 + 40)))
+    else:
+        st.info("No leads match these filters. Try another status, country or search.")
+    view_path = Path(summary["db_path"]).parent / "current_view.csv"
+
+    def build_view():
+        with _file_lock:
+            export_view_csv(summary["db_path"], view_path, **query)
+            return view_path.read_bytes()
+
+    st.download_button(
+        f"Download this view · {total:,} rows (CSV)", data=build_view, file_name="leads_current_view.csv",
+        mime="text/csv", key="export_view_" + summary["batch_id"], on_click="ignore", disabled=not total,
+        help="Exactly the filtered and sorted rows above, across all pages.",
+    )
+
+
+def render_organize_tab(summary):
+    st.markdown(
+        '<div class="section-note">Group leads by country, state, verdict or any column. '
+        "Download an Excel workbook with one sorted sheet per group.</div>",
+        unsafe_allow_html=True,
+    )
+    a, b, c = st.columns([1.2, 1.2, 1])
+    with a:
+        group_by = st.selectbox("Group by", _group_choices(summary), key="org_group", format_func=_choice_label)
+    with b:
+        sort_by = st.selectbox("Sort inside each group by", _sort_choices(summary), key="org_sort",
+                               format_func=_choice_label)
+    with c:
+        descending = st.selectbox("Order", ["Ascending", "Descending"], key="org_order") == "Descending"
+    status, search, filters = _filter_widgets(summary, "org_")
+    groups = group_counts(summary["db_path"], group_by, status=status, search=search, filters=filters)
+    if groups.empty:
+        st.info("No leads match these filters.")
+        return
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.dataframe(
+            groups, hide_index=True, width="stretch", height=min(430, 38 + 35 * len(groups)),
+            column_config={group_by: st.column_config.TextColumn(_label(group_by)),
+                           "Avg score": st.column_config.ProgressColumn("Avg score", min_value=0, max_value=100, format="%.0f")},
+        )
+        st.caption(f"{len(groups):,} groups · {int(groups['Leads'].sum()):,} leads")
+    with right:
+        top = groups.head(15).set_index(group_by)[["Good", "Review", "Bad"]]
+        st.bar_chart(top, horizontal=True, color=["#14B8A6", "#D3AA4E", "#F87171"], stack=True, height=430, sort=False)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in group_by).strip("_").lower() or "group"
+    workbook_path = Path(summary["db_path"]).parent / f"organized_{safe}.xlsx"
+
+    def build_workbook():
+        with _file_lock:
+            generate_organized_xlsx(summary["db_path"], workbook_path, group_by, sort_by=sort_by,
+                                    descending=descending, status=status, search=search, filters=filters)
+            return workbook_path.read_bytes()
+
+    st.download_button(
+        f"Download organized workbook · one sheet per {_label(group_by).lower()} (.xlsx)",
+        data=build_workbook, file_name=f"leads_by_{safe}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="export_org_" + summary["batch_id"], on_click="ignore", type="primary",
+        help="Up to 120 group sheets; any remaining groups go into an 'Other groups' sheet.",
+    )
+
+
+def render_export_tab(summary):
+    st.markdown('<div class="section-note">All original columns, with verdicts, scores and every check appended. '
+                "Exports always cover the full category.</div>", unsafe_allow_html=True)
+    counts = summary["counts"]
+    downloads = [
+        ("Good leads", "good_csv", "good_leads.csv", f"{counts.get('good', 0):,} rows ready to contact", "primary"),
+        ("Needs review", "review_csv", "review_leads.csv", f"{counts.get('review', 0):,} rows to double-check", "secondary"),
+        ("Bad leads", "bad_csv", "bad_leads.csv", f"{counts.get('bad', 0):,} rows to remove or fix", "secondary"),
+        ("Full report", "full_csv", "full_lead_report.csv", "Every row and every check", "secondary"),
+    ]
+    if summary.get("checks", {}).get("email", True):
+        downloads.append(("Valid emails only", "valid_csv", "valid_email_leads.csv",
+                          f"{counts.get('valid', 0):,} rows with a valid email", "secondary"))
+    columns = st.columns(len(downloads))
+    for column, (label, key, filename, help_text, kind) in zip(columns, downloads):
+        with column:
+            path = summary["exports"].get(key)
+            if not path:
+                continue
+            st.download_button(f"{label} · CSV", data=lambda path=path: download_file(path), file_name=filename,
+                               mime="text/csv", key="export_" + key + summary["batch_id"], on_click="ignore",
+                               type=kind, width="stretch", help=help_text)
+            st.caption(help_text)
+    xlsx_path = Path(summary["db_path"]).parent / "full_lead_report.xlsx"
+
+    def build_xlsx():
+        with _file_lock:
+            if not xlsx_path.exists():
+                generate_xlsx(summary["db_path"], xlsx_path)
+            return xlsx_path.read_bytes()
+
+    st.download_button("Full report · Excel (.xlsx) with summary sheet", data=build_xlsx,
+                       file_name="full_lead_report.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="export_xlsx_" + summary["batch_id"], on_click="ignore")
+
+
+def render_details_tab(summary):
+    checks = summary.get("checks", {})
+    st.caption(f'Batch {summary["batch_id"]} · {summary.get("source_name", summary.get("filename", "Lead sheet"))} · '
+               f'{summary.get("duration_seconds", 0):,.1f}s · {summary.get("unique_domains", 0):,} unique domains')
+    ran = [name for name, on in (("Email syntax & duplicates", checks.get("email")), ("Domain DNS / MX", checks.get("email")),
+                                 ("Mailbox (SMTP)", checks.get("smtp")), ("Phone validation", checks.get("phone")),
+                                 ("Live phone line", checks.get("line")), ("Company domain age", checks.get("domain_age")),
+                                 ("Client age", checks.get("dob")), ("Lead age", checks.get("created")),
+                                 ("Activity status", checks.get("activity"))) if on]
+    st.write("**Checks in this run:** " + ", ".join(ran))
+    if summary.get("mapping"):
+        st.write("**Columns used:** " + " · ".join(f"{FIELD_LABELS.get(k, k)} → `{v}`" for k, v in summary["mapping"].items()))
+    st.markdown(
+        "- **Mailbox: Exists** — the recipient's mail server confirmed the mailbox. This is the strongest signal available "
+        "without sending an email.\n"
+        "- **Catch-all** — the server accepts every address, so no checker can confirm the mailbox; graded Review.\n"
+        "- **Unverifiable** — the server refused or delayed the check (greylisting, anti-abuse). The email keeps its DNS result.\n"
+        "- **Phone status** validates the number against official numbering plans (country, length, type, carrier). "
+        "Whether a line is switched on right now needs the optional live carrier lookup.\n"
+        "- Duplicates compare emails ignoring case and spaces; phones compare in international (E.164) format."
+    )
+    if summary.get("column_renames"):
+        st.write("Original columns renamed to avoid collisions:")
+        st.json(summary["column_renames"])
+    if st.session_state.get("recovery_code"):
+        st.write("Private recovery code — treat it as access to the saved lead sheet:")
+        st.code(st.session_state.recovery_code, language=None)
 
 
 def render_results(summary):
     counts = summary["counts"]
+    checks = summary.get("checks", {"email": True})
     st.success(
-        f'Run complete · {counts["total"]:,} rows reviewed · {counts["valid"]:,} valid · {counts["risky"]:,} risky · {counts["invalid"]:,} invalid'
+        f'Run complete · {counts["total"]:,} leads · {counts.get("good", 0):,} good · '
+        f'{counts.get("review", 0):,} to review · {counts.get("bad", 0):,} bad'
     )
+    for note in summary.get("notes", []):
+        st.warning(note)
     for message in st.session_state.get("run_messages", []):
         st.caption(message)
-    st.markdown(
-        '<div class="section-title">Your verification report</div><div class="section-note">Every row has a clear outcome. Filter the view, then choose the export you need.</div>',
-        unsafe_allow_html=True,
-    )
-    left, middle, right = st.columns([1, 1.8, 0.75])
-    with left:
-        status = st.selectbox(
-            "Validation status",
-            ["All", "Valid", "Invalid", "Risky"],
-            key="result_status",
-        )
-    with middle:
-        search = st.text_input(
-            "Search this report",
-            placeholder="Email, company, reason…",
-            key="result_search",
-        )
-    with right:
-        limit = st.selectbox("Rows per page", [50, 100, 250], index=1, key="page_size")
-    filter_key = (summary["batch_id"], status, search, limit)
-    if st.session_state.get("last_filter") != filter_key:
-        st.session_state.report_page = 1
-        st.session_state.last_filter = filter_key
-    frame, total = read_results(
-        summary["db_path"], status=status, search=search, limit=limit, offset=0
-    )
-    pages = max(1, math.ceil(total / limit))
-    pagination, info_col = st.columns([1, 3])
-    with pagination:
-        page = st.number_input(
-            "Page", min_value=1, max_value=pages, step=1, key="report_page"
-        )
-    if page > 1:
-        frame, total = read_results(
-            summary["db_path"],
-            status=status,
-            search=search,
-            limit=limit,
-            offset=(page - 1) * limit,
-        )
-    with info_col:
-        st.caption(
-            f"{total:,} matching rows · Page {page:,} of {pages:,}. Exports include the complete category, independent of this view."
-        )
-    if total:
-        leading = ["Verification_Status", summary["email_column"], "Reason"]
-        display_order = list(dict.fromkeys(leading + list(frame.columns)))
-        st.dataframe(
-            frame,
-            column_order=display_order,
-            column_config={
-                "Verification_Status": st.column_config.TextColumn(
-                    "Status", width="small"
-                ),
-                "Reason": st.column_config.TextColumn("Reason", width="large"),
-            },
-            hide_index=True,
-            width="stretch",
-            height=min(460, max(180, len(frame) * 35 + 40)),
-        )
-    else:
-        st.info("No rows match this filter. Try another status or search.")
-    st.caption(
-        f'{counts["duplicates"]:,} duplicate rows · {counts["role"]:,} role accounts · {counts["disposable"]:,} disposable addresses. Flags can overlap.'
-    )
-    st.markdown(
-        '<div class="section-title" style="margin-top:15px">Take your list forward</div><div class="section-note">All original columns, with verification status and reasons appended.</div>',
-        unsafe_allow_html=True,
-    )
-    downloads = [
-        (
-            "Full report · CSV",
-            "full_csv",
-            "openhousefx_full_report.csv",
-            "All rows and all outcomes.",
-        ),
-        (
-            "Valid only · CSV",
-            "valid_csv",
-            "mx_verified_leads.csv",
-            "Unique addresses with passing syntax and MX checks; no risky flags.",
-        ),
-        (
-            "Invalid & risky · CSV",
-            "invalid_risky_csv",
-            "openhousefx_review_report.csv",
-            "Rows to remove or review.",
-        ),
-        (
-            "Role & disposable · CSV",
-            "role_disposable_csv",
-            "openhousefx_role_disposable.csv",
-            "All role or disposable rows, including duplicates.",
-        ),
-    ]
-    for column, (label, key, filename, help_text) in zip(st.columns(4), downloads):
-        with column:
-            path = summary["exports"][key]
-            st.download_button(
-                label,
-                data=lambda path=path: download_file(path),
-                file_name=filename,
-                mime="text/csv",
-                key="export_" + key + summary["batch_id"],
-                on_click="ignore",
-                type="primary" if key == "valid_csv" else "secondary",
-                width="stretch",
-                help=help_text,
-            )
-    xlsx_path = str(Path(summary["db_path"]).parent / "openhousefx_full_report.xlsx")
-    if not Path(xlsx_path).exists():
-        if st.button(
-            "Prepare full Excel report",
-            key="prepare_xlsx",
-            help="Generated on demand to keep normal verification fast.",
-        ):
-            try:
-                with st.spinner("Preparing Excel report…"):
-                    with _xlsx_lock:
-                        generate_xlsx(summary["db_path"], xlsx_path)
-                st.rerun()
-            except Exception as exc:
-                st.error(
-                    f"Excel export could not be prepared: {exc}. Your CSV reports are still available."
-                )
-    else:
-        st.download_button(
-            "Full report · Excel (.xlsx)",
-            data=lambda: download_file(xlsx_path),
-            file_name="openhousefx_full_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="export_xlsx_" + summary["batch_id"],
-            on_click="ignore",
-        )
-    with st.expander("Run details & interpretation"):
-        st.caption(
-            f'Batch {summary["batch_id"]} · {summary.get("source_name",summary.get("filename","Lead sheet"))}'
-        )
-        st.write(
-            "**Valid** means syntax and MX checks passed. It does not confirm mailbox existence or guarantee delivery. Timeouts and temporary DNS failures are risky; retry them later. An A/AAAA fallback is also risky because it does not confirm an email service."
-        )
-        st.caption(
-            "Duplicate comparison trims surrounding spaces and ignores case. Plus tags and dots are retained. All original rows remain in the full report."
-        )
-        if summary.get("column_renames"):
-            st.write(
-                "Original columns renamed to avoid duplicate names or verification-field collisions:"
-            )
-            st.json(summary["column_renames"])
-        if st.session_state.get("recovery_code"):
-            st.write(
-                "Private recovery code — treat it as access to the saved lead sheet:"
-            )
-            st.code(st.session_state.recovery_code, language=None)
+    show_chips(counts, checks)
+    leads, organize, export, details = st.tabs(["Leads", "Organize & group", "Export", "Run details"])
+    with leads:
+        render_leads_tab(summary)
+    with organize:
+        render_organize_tab(summary)
+    with export:
+        render_export_tab(summary)
+    with details:
+        render_details_tab(summary)
 
 
 def main():
@@ -1539,9 +878,14 @@ def main():
     )
     st.markdown(brand_css(), unsafe_allow_html=True)
     workspace = get_workspace()
-    workers, batch_size, persist, log_metadata = render_sidebar()
+    settings = render_sidebar()
     st.markdown(
-        '<div class="crumbs"><div class="crumbs-label">Openhousefx <b>/ &nbsp; Verification workspace</b></div><div class="local-pill"><i></i>Private session</div></div><div class="eyebrow">THE CONFIDENCE BEFORE CONTACT</div><div class="hero-title" role="heading" aria-level="1">Every lead. <span>A clearer picture.</span></div><p class="hero-copy">Bring your list into focus. Check email syntax, domain records and list hygiene in one considered workspace.</p>',
+        '<div class="crumbs"><div class="crumbs-label">Openhousefx <b>/ &nbsp; Verification workspace</b></div>'
+        '<div class="local-pill"><i></i>Private session</div></div>'
+        '<div class="eyebrow">THE CONFIDENCE BEFORE CONTACT</div>'
+        '<div class="hero-title" role="heading" aria-level="1">Every lead. <span>A clearer picture.</span></div>'
+        '<p class="hero-copy">Verify emails down to the mailbox, validate phone numbers, see each client\'s age and '
+        "activity, then sort and group your list by name, state or country.</p>",
         unsafe_allow_html=True,
     )
     metrics_slot = st.empty()
@@ -1549,34 +893,32 @@ def main():
         source = render_input(workspace)
         if source:
             completed = st.session_state.get("result")
-            same_run = (
-                completed is not None
-                and st.session_state.get("result_source") == source["signature"]
-            )
+            same_run = completed is not None and st.session_state.get("result_source") == source["signature"]
             if completed and not same_run and not st.session_state.get("restored"):
                 st.session_state.pop("result", None)
+            mapping = source["mapping"]
             if st.button(
                 "Verify again" if same_run else "Verify lead list",
                 type="primary",
                 width="stretch",
-                disabled=source["email_index"] is None
+                disabled=(mapping.get("email") is None and mapping.get("phone") is None)
                 or not source["info"].get("row_count", 0),
             ):
-                execute_run(
-                    source, workers, batch_size, persist, log_metadata, metrics_slot
-                )
+                execute_run(source, settings, metrics_slot)
     summary = st.session_state.get("result")
     with metrics_slot.container():
-        show_metrics(summary["counts"] if summary else {})
+        show_metrics(summary["counts"] if summary else {}, summary.get("checks") if summary else None)
     if summary:
         render_results(summary)
     else:
         st.markdown(
-            '<div class="section-title">Live workspace</div><div class="section-note">Your report will appear here when the check is complete.</div><div class="workspace-empty"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M4 5h16v14H4z M4 6l8 6 8-6"/><path d="m8 16 2 2 5-5"/></svg></div><div class="empty-title">A cleaner list starts here.</div><div class="empty-copy">Upload your lead sheet above, confirm the email column, and run your first check. Every original row stays in your full report.</div></div>',
+            '<div class="section-title">Live workspace</div><div class="section-note">Your report will appear here when '
+            'the check is complete.</div><div class="workspace-empty"><div class="empty-icon"><svg viewBox="0 0 24 24" '
+            'fill="none" stroke="currentColor" stroke-width="1.3"><path d="M4 5h16v14H4z M4 6l8 6 8-6"/><path d="m8 16 2 2 5-5"/>'
+            '</svg></div><div class="empty-title">A cleaner list starts here.</div><div class="empty-copy">Upload your lead '
+            "sheet above, confirm the email and phone columns, and run your first check. Each lead gets a Good / Review / Bad "
+            "verdict, a 0–100 score and a plain-English reason.</div></div>",
             unsafe_allow_html=True,
-        )
-        st.caption(
-            "Checks confirm syntax and domain records. Mailbox existence and delivery are not guaranteed."
         )
     st.markdown(
         '<div class="footer-note"><span>OPENHOUSEFX · LEAD VERIFIER</span><span>Thoughtfully checked. Clearly organized.</span></div>',

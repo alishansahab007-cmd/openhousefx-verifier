@@ -1,40 +1,23 @@
-# Release validation - OpenhouseFX Lead Verifier 2.0.0
+# Release validation – OpenhouseFX Lead Verifier 3.0.0
 
-Validated locally on 2026-10-28 using Python 3.12 and Streamlit 1.66.1.
+Validated on 2026-11-20 with Python 3.12 and Streamlit 1.66.1, from a clean install of `requirements-dev.txt`.
 
-## Automated verification
+## Automated tests
 
-Final complete suite: **43 passed in 43.93 seconds**, with the 100,000-row test enabled.
+`python -m pytest -q` → **101 passed**, plus the 100,000-row stress test with `RUN_STRESS=1` (about a minute).
 
-- 27 engine/integration cases cover CSV (UTF-8/BOM/Latin-1), XLSX and legacy XLS; column detection and manual mapping; malformed syntax and internationalized domains; duplicates across chunks; role/disposable detection and subdomains; null MX, NXDOMAIN, timeout, temporary failure and A/AAAA fallback; original cell preservation; filtered and full CSV/XLSX exports; literal Excel formula-like strings; pagination; incomplete-run rejection; saved-disk recovery; and mocked metadata-only Supabase logging.
-- 9 DNS configuration cases cover system resolvers, empty-system fallback, explicit overrides, invalid configuration, and thread-local configuration changes.
-- 7 Streamlit AppTest cases cover initial rendering, retained report state across filters/settings, lazy exports, Excel preparation, manual column mapping, and graceful rejection of missing/corrupt saved runs.
+- **Checks (≈78 cases):** column auto-detection; messy-cell email extraction; syntax; typo suggestions incl. false-positive guards; role / no-reply / placeholder / disposable / free flags; DNS (MX, MX hosts that don't resolve, null MX, NXDOMAIN, A fallback, timeout, resolver override); SMTP reply classification (Gmail, Microsoft 365, greylisting, Spamhaus blocks, full / disabled mailboxes); a local fake SMTP server for exists / missing / catch-all / reconnects / unreachable; per-provider breaker; ZeroBounce mapping; phone parsing (national, international, `00` prefix, Excel-stripped `+`, Excel number cells, placeholders); Twilio parsing; country/state standardization; dates, ages, activity.
+- **Engine (17 cases):** 15-row end-to-end run with every verdict path; each domain/mailbox checked once; DNS retry pass; people / location / activity / domain age; original values and column order; category exports partition the list; sort / filter / search / group; SQL-injection-safe sorting; Excel and organized workbooks; literal formula text; phone-only lists; port-25-blocked fallback; strict mode; XLSX / XLS / cp1252-semicolon inputs; failing lookups never sink a run.
+- **UI (5 AppTest cases):** initial render, results tabs, sorting + country + verdict filters, group by state, saved-run recovery errors.
 
-The 100,000-row case uses deterministic DNS results, 1,000-row batches and 25 domains. It asserts exactly 25 domain lookups, complete exports and correct final-page results. This is a regression/stress fixture, not a guarantee of live-network throughput or arbitrary host capacity.
+## Live checks (this machine's home network)
 
-Reproduce from the project root:
+- Gmail, ProtonMail and Zoho mail servers confirmed real mailboxes (`postmaster@`) and rejected made-up ones (`550 5.1.1`).
+- Outlook / Microsoft 365, Yahoo/AOL and iCloud could not be reached on port 25 from this network: they were reported as *Unverifiable* with the reason, and the provider breaker cut the run from 297 s to 32 s.
+- RDAP returned registration dates (e.g. github.com → 2007-10-09); an unregistered test domain returned *Not registered*.
+- The sample file was uploaded through the browser: verdicts, chips, filters, sorting, the group-by-country chart and all export buttons rendered correctly.
 
-```powershell
-python -m pip install -r requirements-dev.txt
-$env:RUN_STRESS = '1'
-python -m pytest tests -q
-```
+## Not performed
 
-On macOS/Linux: `RUN_STRESS=1 python -m pytest tests -q`.
-
-## Live browser and DNS checks
-
-- Local Streamlit health endpoint returned `ok`.
-- Gmail and Outlook returned explicit MX records; a deliberately nonexistent test domain returned NXDOMAIN.
-- The supplied synthetic seven-row sample was uploaded through the browser. The completed report showed 2 Valid, 2 Risky and 3 Invalid rows.
-- Downloaded the Valid-only CSV through its deferred download button. Confirmed two Valid rows and retained leading zeroes in the original Phone column.
-- Prepared the full Excel report in the browser; the result table and CSV downloads remained available.
-- Visually inspected the original Inter/Plus Jakarta Sans fonts, house mark, navy/gold theme, input mapping, result table and export controls. Screenshots are in this folder.
-
-## Deployment and integration boundaries
-
-Supabase logging was tested with a mocked HTTPS service. No actual Supabase credentials were supplied and no external database was changed. Local SQLite save/restore was tested; persistence on Render requires a configured persistent disk. A browser reload or server restart still ends an unsaved session.
-
-Render deployment and GitHub push were not performed. The included README, render.yaml, .streamlit configuration and environment example describe installation and deployment. Upload the complete project, including its hidden configuration, font assets and disposable-domain data.
-
-Verification checks syntax, list hygiene and domain mail records. It does not confirm individual mailbox existence or guarantee email delivery.
+- GitHub push and Render deployment (no credentials used). Render blocks port 25 on all plans, so mailbox checks there need `ZEROBOUNCE_API_KEY`.
+- Live Twilio and ZeroBounce calls (no keys supplied); both are covered by mocked tests.
